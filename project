@@ -1,0 +1,242 @@
+import os
+import cv2
+import numpy as np
+import argparse
+import pyttsx3
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+
+# ==============================
+# CONFIGURATION
+# ==============================
+IMG_SIZE = 64
+DATASET_PATH = r"E:\bml\cnn_resized"      # Change to your dataset folder
+MODEL_NAME = r"D:\bml\cnn_braille_numbers.keras"
+BEST_WEIGHTS = r"D:\bml\cnn_braille_numbers_best.weights.h5"
+
+# ==============================
+# 1. Load Dataset
+# ==============================
+def load_dataset(path=DATASET_PATH, img_size=IMG_SIZE):
+    data, labels = [], []
+    classes = [str(i) for i in range(1, 8)]  # Folders 1–7
+
+    for idx, c in enumerate(classes):
+        class_dir = os.path.join(path, c)
+        if not os.path.isdir(class_dir):
+            continue
+        count = 0
+        for img_name in os.listdir(class_dir):
+            if not img_name.lower().endswith((".png", ".jpg", ".jpeg")):
+                continue
+            img_path = os.path.join(class_dir, img_name)
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+            # Normalize lighting for training images
+            img = cv2.equalizeHist(img)
+            img = cv2.resize(img, (img_size, img_size))
+            img = img.astype("float32") / 255.0
+            img = np.expand_dims(img, axis=-1)
+            data.append(img)
+            labels.append(idx)
+            count += 1
+        print(f"   Loaded {count} images for Class {c}")
+
+    data = np.array(data)
+    labels = to_categorical(np.array(labels), num_classes=len(classes))
+    print(f"[ℹ️] Total images: {len(data)}")
+    return data, labels, classes
+
+
+# ==============================
+# 2. Build Deep CNN
+# ==============================
+def build_cnn(input_shape=(IMG_SIZE, IMG_SIZE, 1), num_classes=7):
+    model = Sequential([
+        Conv2D(32, (3,3), activation="relu", padding="same", input_shape=input_shape),
+        BatchNormalization(),
+        MaxPooling2D((2,2)),
+        Dropout(0.2),
+
+        Conv2D(64, (3,3), activation="relu", padding="same"),
+        BatchNormalization(),
+        MaxPooling2D((2,2)),
+        Dropout(0.3),
+
+        Conv2D(128, (3,3), activation="relu", padding="same"),
+        BatchNormalization(),
+        MaxPooling2D((2,2)),
+        Dropout(0.4),
+
+        Flatten(),
+        Dense(128, activation="relu"),
+        Dropout(0.5),
+        Dense(num_classes, activation="softmax")
+    ])
+
+    model.compile(
+        optimizer=Adam(learning_rate=0.0005),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+    return model
+
+
+# ==============================
+# 3. Train Model
+# ==============================
+def train_model():
+    print("[📦] Loading dataset...")
+    X, y, classes = load_dataset(DATASET_PATH, IMG_SIZE)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    print("[🧠] Building Deep CNN...")
+    model = build_cnn((IMG_SIZE, IMG_SIZE, 1), num_classes=y.shape[1])
+    model.summary()
+
+    # ⚖️ Compute class weights
+    y_int = np.argmax(y_train, axis=1)
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_int), y=y_int)
+    class_weights = dict(enumerate(class_weights))
+    print("[⚖️] Class weights:", class_weights)
+
+    # 🎨 Data augmentation
+    datagen = ImageDataGenerator(
+        rotation_range=10,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        zoom_range=0.1,
+        brightness_range=[0.8, 1.2]
+    )
+    datagen.fit(X_train)
+
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True),
+        ModelCheckpoint(
+            filepath=BEST_WEIGHTS,
+            monitor='val_accuracy',
+            save_best_only=True,
+            save_weights_only=True,
+            verbose=1
+        )
+    ]
+
+    print("[🚀] Training started...")
+    history = model.fit(
+        datagen.flow(X_train, y_train, batch_size=32),
+        validation_data=(X_test, y_test),
+        epochs=40,
+        class_weight=class_weights,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    # Save final model
+    model.save(MODEL_NAME)
+    print(f"[💾] Final model saved at: {MODEL_NAME}")
+
+    # Evaluate
+    loss, acc = model.evaluate(X_test, y_test, verbose=0)
+    print(f"[🎯] Test Accuracy: {acc*100:.2f}%  |  Test Loss: {loss:.4f}")
+
+    # Print summary
+    print("\n[📈] Training history summary:")
+    for i, (l, a, vl, va) in enumerate(zip(
+        history.history['loss'],
+        history.history['accuracy'],
+        history.history['val_loss'],
+        history.history['val_accuracy']
+    )):
+        print(f" Epoch {i+1:02d}: loss={l:.4f}, acc={a:.4f}, val_loss={vl:.4f}, val_acc={va:.4f}")
+
+
+# ==============================
+# 4. Realtime Prediction
+# ==============================
+def realtime_prediction():
+    if not os.path.exists(MODEL_NAME):
+        print("[❌] No trained model found. Train first with --train")
+        return
+
+    model = load_model(MODEL_NAME)
+    if os.path.exists(BEST_WEIGHTS):
+        model.load_weights(BEST_WEIGHTS)
+        print("[✅] Loaded best weights for accurate prediction.")
+
+    _, _, classes = load_dataset(DATASET_PATH, IMG_SIZE)
+    cap = cv2.VideoCapture(0)
+    engine = pyttsx3.init()
+
+    recent_preds = []
+    buffer_size = 5
+    displayed_number = None
+
+    print("[📷] Starting realtime recognition. Press 'q' to quit.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        x, y, w, h = 100, 100, 200, 200
+        roi = frame[y:y+h, x:x+w]
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE))
+        gray = gray.astype("float32") / 255.0
+        gray = np.expand_dims(gray, axis=-1)
+        gray = np.expand_dims(gray, axis=0)
+
+        pred = model.predict(gray, verbose=0)
+        label_idx = np.argmax(pred)
+        conf = np.max(pred)
+        label = classes[label_idx]
+
+        recent_preds.append(label)
+        if len(recent_preds) > buffer_size:
+            recent_preds.pop(0)
+
+        most_common = max(set(recent_preds), key=recent_preds.count)
+        freq = recent_preds.count(most_common)
+
+        if freq >= (buffer_size // 2 + 1) and most_common != displayed_number:
+            displayed_number = most_common
+            print(f"[✅] Detected Braille Number: {displayed_number}, Confidence: {conf*100:.2f}%")
+            engine.say(f"Detected number {displayed_number}")
+            engine.runAndWait()
+
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(frame, f"Num: {label} ({conf*100:.1f}%)",
+                    (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        cv2.imshow("Realtime Braille Num Recognition (Deep CNN)", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# ==============================
+# 5. Main
+# ==============================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train", action="store_true", help="Train the model")
+    parser.add_argument("--realtime", action="store_true", help="Run realtime webcam")
+    args = parser.parse_args()
+
+    if args.train:
+        train_model()
+    elif args.realtime:
+        realtime_prediction()
+    else:
+        print("Usage: python braille_cnn.py [--train | --realtime]")
